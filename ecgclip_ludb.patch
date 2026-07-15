@@ -1,0 +1,522 @@
+diff -ruN original/README_LUDB.md modified/README_LUDB.md
+--- original/README_LUDB.md	2026-07-15 19:02:04.780270151 +0000
++++ modified/README_LUDB.md	2026-07-15 19:02:04.788568742 +0000
+@@ -0,0 +1,76 @@
++# LUDB adapter for ecgclip
++
++This adapter keeps the existing ecgclip model and training scripts unchanged. It prepares LUDB into the same interface they already consume:
++
++- `WORK_DIR/labels.csv`, indexed by `ecg_id`
++- `WORK_DIR/images/<ecg_id>.png`
++- folds 1–8 for train, 9 for validation, and 10 for test
++- one binary column per class in `config.CLASSES`
++
++## 1. Copy files
++
++Copy `config.py` over the repository's current `config.py`, and add `prepare_ludb.py` to the repository root. Add the line from `requirements_ludb.txt` to the existing `requirements.txt`.
++
++## 2. Download LUDB
++
++```bash
++mkdir -p data/ludb
++wget -r -N -c -np https://physionet.org/files/ludb/1.0.1/
++```
++
++Depending on how `wget` lays out the folders, set `DATA_DIR` to the directory that directly contains:
++
++```text
++ludb.csv
++RECORDS
++data/1.hea
++data/1.dat
++...
++```
++
++## 3. Prepare metadata and images
++
++```bash
++export ECG_DATASET=ludb
++export DATA_DIR=/absolute/path/to/ludb/1.0.1
++export WORK_DIR=./work_ludb
++
++pip install -r requirements.txt
++python prepare_ludb.py --limit 40   # smoke test
++python prepare_ludb.py              # all 200 records
++```
++
++For metadata only:
++
++```bash
++python prepare_ludb.py --no-render
++```
++
++## 4. Run the existing pipeline
++
++```bash
++python zero_shot_eval.py --task multi
++python extract_features.py
++python linear_probe.py
++python finetune_clip.py --caption label
++python zero_shot_eval.py --task multi --ckpt work_ludb/checkpoints/biomedclip_ft.pt
++```
++
++All downstream scripts continue to import `config.py`, so keep `ECG_DATASET=ludb`, `DATA_DIR`, and `WORK_DIR` set in the same shell or tmux session.
++
++## Label definition
++
++LUDB does not provide PTB-XL's five SCP diagnostic superclasses. This adapter defines a new record-level multi-label task from the official `ludb.csv` columns:
++
++- `ARR`: non-sinus-family rhythm or extrasystoles
++- `CD`: conduction abnormality or cardiac pacing
++- `HYP`: hypertrophy or chamber overload
++- `ISCHEMIA`: ischemia, STEMI, NSTEMI-like, or scar entry
++- `REPOL`: non-specific or early repolarization abnormality
++- `NORM`: none of the five abnormal categories above
++
++This mapping is derived for compatibility with ecgclip and should be documented as such in experiments.
++
++## Important distinction from med-ts-llm
++
++The linked `med-ts-llm/datasets/ludb.py` does not read the raw PhysioNet release. It reads project-specific preprocessed `train.csv`/`test.csv` files, treats each ECG lead as an individual clip, and uses P/QRS/T delineation labels for semantic segmentation. The adapter here instead keeps ecgclip's existing record-level, 12-lead image-classification design.
+diff -ruN original/config.py modified/config.py
+--- original/config.py	2026-07-15 19:02:04.741677860 +0000
++++ modified/config.py	2026-07-15 19:02:04.754609039 +0000
+@@ -1,55 +1,85 @@
+ """
+-Central configuration for the BiomedCLIP x PTB-XL project.
++Central configuration for BiomedCLIP experiments on PTB-XL or LUDB.
+ 
+-Edit DATA_DIR to point at the folder that contains `ptbxl_database.csv`
+-(i.e. the root of the downloaded PTB-XL dataset).
+-"""
+-import os
+-
+-# ----------------------------------------------------------------------------
+-# Paths
+-# ----------------------------------------------------------------------------
+-# Root of the extracted PTB-XL dataset (contains ptbxl_database.csv,
+-# scp_statements.csv, records100/, records500/)
+-DATA_DIR = os.environ.get("DATA_DIR", "/lambda/nfs/Kiana2/ecgclip/data/ptbxl")
++Select the dataset with:
++    export ECG_DATASET=ptbxl   # default
++or:
++    export ECG_DATASET=ludb
+ 
+-# Where rendered ECG images and cached features/checkpoints go
+-WORK_DIR = os.environ.get("WORK_DIR", "./work")
+-IMG_DIR = os.path.join(WORK_DIR, "images")          # rendered ECG PNGs
+-FEAT_DIR = os.path.join(WORK_DIR, "features")        # cached embeddings
+-CKPT_DIR = os.path.join(WORK_DIR, "checkpoints")     # fine-tuned weights
++DATA_DIR and WORK_DIR can still be overridden with environment variables.
++"""
++from __future__ import annotations
+ 
+-for _d in (WORK_DIR, IMG_DIR, FEAT_DIR, CKPT_DIR):
+-    os.makedirs(_d, exist_ok=True)
++import os
+ 
+-# ----------------------------------------------------------------------------
+-# Data settings
+-# ----------------------------------------------------------------------------
+-SAMPLING_RATE = 100          # 100 -> records100 (fast), 500 -> records500 (hi-res)
+-FILENAME_COL = "filename_lr" if SAMPLING_RATE == 100 else "filename_hr"
+ 
+-# PTB-XL recommended split: folds 1-8 train, 9 val, 10 test
++DATASET = os.environ.get("ECG_DATASET", "ptbxl").strip().lower()
++if DATASET not in {"ptbxl", "ludb"}:
++    raise ValueError(
++        f"Unsupported ECG_DATASET={DATASET!r}. Expected 'ptbxl' or 'ludb'."
++    )
++
++# ----------------------------------------------------------------------------
++# Dataset-specific paths, labels, and signal settings
++# ----------------------------------------------------------------------------
++if DATASET == "ptbxl":
++    DEFAULT_DATA_DIR = "/lambda/nfs/Kiana2/ecgclip/data/ptbxl"
++    DEFAULT_WORK_DIR = "./work"
++
++    SAMPLING_RATE = int(os.environ.get("SAMPLING_RATE", "100"))
++    if SAMPLING_RATE not in {100, 500}:
++        raise ValueError("PTB-XL SAMPLING_RATE must be 100 or 500")
++    FILENAME_COL = "filename_lr" if SAMPLING_RATE == 100 else "filename_hr"
++
++    CLASSES = ["NORM", "MI", "STTC", "CD", "HYP"]
++    CLASS_DESCRIPTIONS = {
++        "NORM": "normal ECG",
++        "MI": "myocardial infarction",
++        "STTC": "ST/T wave change",
++        "CD": "conduction disturbance",
++        "HYP": "cardiac hypertrophy",
++    }
++
++else:  # LUDB
++    # This folder should contain ludb.csv, RECORDS, and data/1.hea ... data/200.dat.
++    DEFAULT_DATA_DIR = "/lambda/nfs/Kiana2/ecgclip/data/ludb/1.0.1"
++    DEFAULT_WORK_DIR = "./work_ludb"
++
++    SAMPLING_RATE = 500
++    FILENAME_COL = "record"
++
++    # These are broad, derived record-level categories for using LUDB with the
++    # existing multi-label classification pipeline. They are not official
++    # LUDB superclasses. See prepare_ludb.py for the exact mapping.
++    CLASSES = ["NORM", "ARR", "CD", "HYP", "ISCHEMIA", "REPOL"]
++    CLASS_DESCRIPTIONS = {
++        "NORM": "normal ECG without a listed abnormality",
++        "ARR": "cardiac arrhythmia or ectopic beats",
++        "CD": "cardiac conduction disturbance or pacing",
++        "HYP": "cardiac chamber hypertrophy or overload",
++        "ISCHEMIA": "myocardial ischemia, infarction, or scar pattern",
++        "REPOL": "non-specific repolarization abnormality",
++    }
++
++DATA_DIR = os.environ.get("DATA_DIR", DEFAULT_DATA_DIR)
++WORK_DIR = os.environ.get("WORK_DIR", DEFAULT_WORK_DIR)
++IMG_DIR = os.path.join(WORK_DIR, "images")
++FEAT_DIR = os.path.join(WORK_DIR, "features")
++CKPT_DIR = os.path.join(WORK_DIR, "checkpoints")
++
++for _directory in (WORK_DIR, IMG_DIR, FEAT_DIR, CKPT_DIR):
++    os.makedirs(_directory, exist_ok=True)
++
++# Both datasets use folds 1-8 for training, 9 for validation, and 10 for test.
++# PTB-XL provides official folds. prepare_ludb.py creates reproducible
++# multi-label-stratified folds for LUDB.
+ TRAIN_FOLDS = list(range(1, 9))
+ VAL_FOLD = 9
+ TEST_FOLD = 10
+ 
+-# The 5 diagnostic SUPERCLASSES (multi-label; a record can carry several)
+-CLASSES = ["NORM", "MI", "STTC", "CD", "HYP"]
+-
+-# Human-readable descriptions used to build text prompts / captions
+-CLASS_DESCRIPTIONS = {
+-    "NORM": "normal ECG",
+-    "MI":   "myocardial infarction",
+-    "STTC": "ST/T wave change",
+-    "CD":   "conduction disturbance",
+-    "HYP":  "cardiac hypertrophy",
+-}
+-
+ # ----------------------------------------------------------------------------
+ # Zero-shot prompt engineering
+ # ----------------------------------------------------------------------------
+-# BiomedCLIP's own template is "this is a photo of ".  We ensemble several
+-# templates and average the resulting text embeddings for robustness.
+ PROMPT_TEMPLATES = [
+     "this is a photo of {}",
+     "an electrocardiogram showing {}",
+@@ -61,22 +91,20 @@
+ # Model
+ # ----------------------------------------------------------------------------
+ BIOMEDCLIP_HF = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+-CONTEXT_LENGTH = 256         # BiomedCLIP tokenizer default
++CONTEXT_LENGTH = 256
+ 
+ # ----------------------------------------------------------------------------
+-# Training hyper-parameters (used by linear_probe.py and finetune_clip.py)
++# Training hyperparameters
+ # ----------------------------------------------------------------------------
+ SEED = 42
+ BATCH_SIZE = 32
+ NUM_WORKERS = 4
+ 
+-# Linear probe
+ LP_EPOCHS = 50
+ LP_LR = 1e-3
+ LP_WEIGHT_DECAY = 1e-4
+ 
+-# Contrastive fine-tune
+ FT_EPOCHS = 5
+ FT_LR = 1e-5
+ FT_WEIGHT_DECAY = 0.1
+-FT_FREEZE_TEXT = True        # freeze PubMedBERT text tower, tune vision tower only
++FT_FREEZE_TEXT = True
+diff -ruN original/prepare_ludb.py modified/prepare_ludb.py
+--- original/prepare_ludb.py	2026-07-15 19:02:04.755841778 +0000
++++ modified/prepare_ludb.py	2026-07-15 19:02:04.767482418 +0000
+@@ -0,0 +1,278 @@
++"""
++Prepare raw LUDB v1.0.1 for the existing ecgclip classification pipeline.
++
++The script:
++  1. reads LUDB's official ludb.csv metadata;
++  2. derives broad record-level multi-label categories;
++  3. creates reproducible folds 1..10;
++  4. writes WORK_DIR/labels.csv in the same shape expected by ecgclip; and
++  5. renders each 12-lead WFDB record to WORK_DIR/images/<id>.png.
++
++Usage:
++    ECG_DATASET=ludb DATA_DIR=/path/to/ludb/1.0.1 python prepare_ludb.py
++    ECG_DATASET=ludb DATA_DIR=/path/to/ludb/1.0.1 python prepare_ludb.py --limit 40
++    ECG_DATASET=ludb DATA_DIR=/path/to/ludb/1.0.1 python prepare_ludb.py --no-render
++"""
++from __future__ import annotations
++
++import argparse
++import os
++import warnings
++from typing import Iterable
++
++import numpy as np
++import pandas as pd
++from sklearn.model_selection import KFold
++from tqdm import tqdm
++
++import config as C
++
++
++LUDb_TEXT_COLUMNS = [
++    "Rhythms",
++    "Electric axis of the heart",
++    "Conduction abnormalities",
++    "Extrasystolies",
++    "Hypertrophies",
++    "Cardiac pacing",
++    "Ischemia",
++    "Non-specific repolarization abnormalities",
++    "Other states",
++]
++
++# These rhythm descriptions are treated as sinus-family rhythms. Arrhythmia is
++# positive when another rhythm is listed or an extrasystole field is present.
++SINUS_FAMILY_RHYTHMS = {
++    "Sinus rhythm",
++    "Sinus bradycardia",
++    "Sinus tachycardia",
++    "Sinus arrhythmia",
++    "Irregular sinus rhythm",
++}
++
++
++def clean_text(value: object) -> str:
++    """Normalize LUDB cells while preserving multiple newline-separated items."""
++    if pd.isna(value):
++        return ""
++    lines = [part.strip() for part in str(value).replace("\r", "\n").split("\n")]
++    return "\n".join(part for part in lines if part)
++
++
++def has_text(series: pd.Series) -> pd.Series:
++    return series.fillna("").astype(str).str.strip().ne("")
++
++
++def derive_label_frame(df: pd.DataFrame) -> pd.DataFrame:
++    """Create broad multi-label targets from official LUDB metadata columns.
++
++    Mapping used by this adapter:
++      ARR       = non-sinus-family rhythm OR any extrasystole
++      CD        = conduction abnormality OR cardiac pacing
++      HYP       = any hypertrophy/overload entry
++      ISCHEMIA  = any ischemia/STEMI/scar/NSTEMI entry
++      REPOL     = non-specific repolarization abnormality OR early repolarization
++      NORM      = none of the five abnormal categories above
++
++    This mapping is intentionally explicit and should be reported as a derived
++    task definition rather than an official LUDB label ontology.
++    """
++    rhythm = df["Rhythms"].fillna("").astype(str).str.strip()
++
++    labels = pd.DataFrame(index=df.index)
++    labels["ARR"] = (~rhythm.isin(SINUS_FAMILY_RHYTHMS)) | has_text(
++        df["Extrasystolies"]
++    )
++    labels["CD"] = has_text(df["Conduction abnormalities"]) | has_text(
++        df["Cardiac pacing"]
++    )
++    labels["HYP"] = has_text(df["Hypertrophies"])
++    labels["ISCHEMIA"] = has_text(df["Ischemia"])
++    labels["REPOL"] = has_text(
++        df["Non-specific repolarization abnormalities"]
++    ) | has_text(df["Other states"])
++    labels["NORM"] = ~labels[["ARR", "CD", "HYP", "ISCHEMIA", "REPOL"]].any(
++        axis=1
++    )
++
++    missing = set(C.CLASSES) - set(labels.columns)
++    if missing:
++        raise ValueError(
++            f"config.CLASSES contains labels not generated by prepare_ludb.py: {missing}"
++        )
++    return labels[C.CLASSES].astype(np.float32)
++
++
++def assign_folds(y: np.ndarray, seed: int = C.SEED) -> np.ndarray:
++    """Return fold numbers 1..10, preferring iterative multi-label stratification."""
++    if len(y) < 10:
++        raise ValueError("At least 10 LUDB records are required to create 10 folds")
++
++    folds = np.zeros(len(y), dtype=np.int64)
++    try:
++        from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
++
++        splitter: Iterable[tuple[np.ndarray, np.ndarray]] = (
++            MultilabelStratifiedKFold(
++                n_splits=10,
++                shuffle=True,
++                random_state=seed,
++            ).split(np.zeros((len(y), 1), dtype=np.float32), y)
++        )
++    except ImportError:
++        warnings.warn(
++            "iterative-stratification is not installed; falling back to KFold. "
++            "Install it for better multi-label class balance: "
++            "pip install iterative-stratification",
++            RuntimeWarning,
++        )
++        splitter = KFold(n_splits=10, shuffle=True, random_state=seed).split(y)
++
++    for fold_number, (_, held_out_indices) in enumerate(splitter, start=1):
++        folds[held_out_indices] = fold_number
++
++    if set(folds.tolist()) != set(range(1, 11)):
++        raise RuntimeError("Failed to assign all LUDB folds 1..10")
++    return folds
++
++
++def build_report(row: pd.Series) -> str:
++    """Build an English text caption from LUDB's expert metadata."""
++    parts: list[str] = []
++    field_names = {
++        "Rhythms": "rhythm",
++        "Electric axis of the heart": "axis",
++        "Conduction abnormalities": "conduction",
++        "Extrasystolies": "ectopy",
++        "Hypertrophies": "hypertrophy/overload",
++        "Cardiac pacing": "pacing",
++        "Ischemia": "ischemia/scar",
++        "Non-specific repolarization abnormalities": "repolarization",
++        "Other states": "other",
++    }
++    for column in LUDb_TEXT_COLUMNS:
++        value = clean_text(row[column]).replace("\n", "; ")
++        if value:
++            parts.append(f"{field_names[column]}: {value}")
++    return ". ".join(parts) if parts else "12-lead electrocardiogram"
++
++
++def load_metadata(data_dir: str = C.DATA_DIR) -> pd.DataFrame:
++    csv_path = os.path.join(data_dir, "ludb.csv")
++    if not os.path.exists(csv_path):
++        raise FileNotFoundError(
++            f"Could not find {csv_path}. DATA_DIR must be the LUDB version root "
++            "containing ludb.csv and the data/ directory."
++        )
++
++    df = pd.read_csv(csv_path)
++    required = {"ID", *LUDb_TEXT_COLUMNS}
++    missing = required - set(df.columns)
++    if missing:
++        raise ValueError(f"ludb.csv is missing required columns: {sorted(missing)}")
++
++    for column in df.columns:
++        if df[column].dtype == object:
++            df[column] = df[column].map(clean_text)
++
++    df["ID"] = pd.to_numeric(df["ID"], errors="raise").astype(int)
++    df = df.set_index("ID")
++    df.index.name = "ecg_id"
++    df["record"] = [os.path.join("data", str(record_id)) for record_id in df.index]
++
++    label_frame = derive_label_frame(df)
++    df["strat_fold"] = assign_folds(label_frame.to_numpy())
++    df["superclasses"] = label_frame.apply(
++        lambda row: [name for name in C.CLASSES if row[name] > 0.5], axis=1
++    )
++    df["report"] = df.apply(build_report, axis=1)
++    for class_name in C.CLASSES:
++        df[class_name] = label_frame[class_name]
++    return df
++
++
++def split_indices(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
++    train = df.strat_fold.isin(C.TRAIN_FOLDS)
++    val = df.strat_fold.eq(C.VAL_FOLD)
++    test = df.strat_fold.eq(C.TEST_FOLD)
++    return train, val, test
++
++
++def image_path_for(ecg_id: int) -> str:
++    return os.path.join(C.IMG_DIR, f"{int(ecg_id):05d}.png")
++
++
++def render_all(df: pd.DataFrame) -> None:
++    # Lazy import keeps --no-render usable in lightweight metadata environments.
++    from ecg_to_image import load_signal, render_to_file
++
++    for ecg_id, row in tqdm(df.iterrows(), total=len(df), desc="Rendering LUDB ECGs"):
++        output_path = image_path_for(int(ecg_id))
++        if os.path.exists(output_path):
++            continue
++
++        signal, fields = load_signal(C.DATA_DIR, row[C.FILENAME_COL])
++        if signal.ndim != 2 or signal.shape[1] != 12:
++            raise ValueError(
++                f"LUDB record {ecg_id} has shape {signal.shape}; expected (samples, 12)"
++            )
++        fs = float(fields.get("fs", C.SAMPLING_RATE))
++        render_to_file(signal, fs, output_path)
++
++
++def save_labels(df: pd.DataFrame) -> str:
++    columns = [C.FILENAME_COL, "strat_fold", "report", "superclasses", *C.CLASSES]
++    metadata = df[columns].copy()
++    metadata["superclasses"] = metadata["superclasses"].map("|".join)
++    output_path = os.path.join(C.WORK_DIR, "labels.csv")
++    metadata.to_csv(output_path)
++    return output_path
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument(
++        "--limit",
++        type=int,
++        default=None,
++        help="use only the first N records after fold assignment (smoke test)",
++    )
++    parser.add_argument(
++        "--no-render",
++        action="store_true",
++        help="write labels.csv without producing PNG files",
++    )
++    args = parser.parse_args()
++
++    if C.DATASET != "ludb":
++        raise RuntimeError(
++            "prepare_ludb.py requires ECG_DATASET=ludb. "
++            "Example: ECG_DATASET=ludb DATA_DIR=/path/to/ludb/1.0.1 "
++            "python prepare_ludb.py"
++        )
++
++    print(f"Loading LUDB metadata from {C.DATA_DIR}")
++    df = load_metadata()
++    if args.limit is not None:
++        if args.limit <= 0:
++            raise ValueError("--limit must be positive")
++        df = df.iloc[: args.limit].copy()
++
++    train, val, test = split_indices(df)
++    print(
++        f"Records: {len(df)} | train {int(train.sum())} | "
++        f"val {int(val.sum())} | test {int(test.sum())}"
++    )
++    for class_name in C.CLASSES:
++        print(f"  {class_name:9s}: {int(df[class_name].sum())} positive")
++
++    labels_path = save_labels(df)
++    print(f"Saved labels -> {labels_path}")
++
++    if not args.no_render:
++        render_all(df)
++        print(f"Images -> {C.IMG_DIR}")
++
++
++if __name__ == "__main__":
++    main()
+diff -ruN original/requirements_ludb.txt modified/requirements_ludb.txt
+--- original/requirements_ludb.txt	2026-07-15 19:02:04.768763538 +0000
++++ modified/requirements_ludb.txt	2026-07-15 19:02:04.779218383 +0000
+@@ -0,0 +1,2 @@
++# Add this to the repository's existing requirements.txt for balanced LUDB folds.
++iterative-stratification>=0.1.9
